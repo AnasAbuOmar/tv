@@ -1,0 +1,919 @@
+<!doctype html>
+<!--
+  «فبركة» TV board (design 1k-1n). A standalone page for a TV's browser: it shows
+  a 4-character code, the host types it on their phone (1k), and it then polls the
+  room's public view. It signs in anonymously, because the `anon` role may execute
+  nothing, and calls two functions granted to `authenticated` by
+  supabase/migrations/0041_bluff_tv.sql.
+
+  CONFIG: `make deploy-tv` fills in the two values in the block below.
+    url      the Supabase project URL, https://<ref>.supabase.co
+    anonKey  the project's anon (public) key
+  Commit neither; leave them empty here. The anon key is public by design, but it
+  belongs to the deploy, not to the repository.
+-->
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>فبركة · التلفاز</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&family=Lalezar&display=swap" rel="stylesheet">
+<script>
+  window.BLUFF_TV_CONFIG = { url: 'https://xgqrnlbbhnofneaygmxw.supabase.co', anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhncXJubGJiaG5vZm5lYXlnbXh3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU1MjMxNDUsImV4cCI6MjEwMTA5OTE0NX0.oqb3ZfprM-6rGxvK4fzM4-ecdl9AMNZr-WuUI4sRNdA' };
+</script>
+<style>
+  :root { --canvas:#0A2C35; --card:#0F3E4A; --ink:#F7F2E7; --gold:#E8B24A; --coin:#F2C14E;
+          --red:#D9534F; --truth:#3F9E5A; --lie:#8E4EC6; --m60:rgba(247,242,231,.6); --m70:rgba(247,242,231,.7); }
+  * { box-sizing:border-box; margin:0; }
+  html, body { height:100%; background:var(--canvas); color:var(--ink); overflow:hidden; }
+  body { font-family:Cairo,sans-serif; }
+  /* A 1920x1080 stage, scaled to whatever the TV's browser reports. */
+  #stage { position:absolute; top:0; left:0; width:1920px; height:1080px; transform-origin:0 0; background:var(--canvas); direction:rtl; }
+  .lz { font-family:Lalezar,Cairo,sans-serif; }
+  .ltr { direction:ltr; display:inline-block; unicode-bidi:isolate; }
+  .row { display:flex; align-items:center; }
+  .pill { padding:14px 30px; border-radius:999px; background:var(--card); font:700 30px Cairo,sans-serif; }
+  .ring { border-radius:50%; display:flex; align-items:center; justify-content:center; flex:none; }
+  .ring > div { border-radius:50%; background:var(--canvas); display:flex; align-items:center; justify-content:center; font-family:Lalezar,sans-serif; }
+  .urgent { animation:pulse 1s ease-in-out infinite; }
+  .truth-pulse { animation:pulse 2.4s ease-in-out infinite; }
+  @keyframes pulse { 50% { transform:scale(1.03); } }
+  @media (prefers-reduced-motion: reduce) { .urgent, .truth-pulse { animation:none; } }
+  .center { position:absolute; top:0; right:0; bottom:0; left:0; display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center; }
+  .badge { display:flex; align-items:center; gap:10px; padding:10px 24px; border-radius:999px; font:700 30px Cairo,sans-serif; flex:none; }
+  .card { border-radius:32px; background:var(--card); padding:30px 36px; }
+  svg { fill:none; stroke:currentColor; stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
+  #net { position:absolute; top:24px; left:50%; transform:translateX(-50%); padding:14px 30px; border-radius:999px; background:var(--card); font:700 28px Cairo,sans-serif; display:none; z-index:2; }
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="net"></div>
+<script>
+(function () {
+  'use strict';
+  var cfg = window.BLUFF_TV_CONFIG || {};
+  var POLL_MS = 1500;
+  var CODE_TTL_MS = 5.5 * 3600 * 1000; // The server drops a code after 6 hours.
+  var stage = document.getElementById('stage');
+  var net = document.getElementById('net');
+
+  // TV browsers lag years behind. Samsung and LG sets still in use run engines
+  // with no conic-gradient and no flexbox `gap`, so both are checked, not assumed.
+  var hasConic = !!(window.CSS && CSS.supports && CSS.supports('background', 'conic-gradient(red,blue)'));
+  var hasFlexGap = (function () {
+    var box = document.createElement('div');
+    box.style.cssText = 'display:flex;flex-direction:column;gap:1px;position:absolute';
+    box.appendChild(document.createElement('div'));
+    box.appendChild(document.createElement('div'));
+    document.body.appendChild(box);
+    var ok = box.scrollHeight === 1;
+    box.remove();
+    return ok;
+  })();
+  function polyfillGap() {
+    if (hasFlexGap) return;
+    Array.prototype.forEach.call(stage.querySelectorAll('*'), function (el) {
+      var css = getComputedStyle(el);
+      if (css.display !== 'flex') return;
+      var gap = (el.getAttribute('style') || '').match(/(?:^|;)\s*gap:(\d+)px/);
+      var size = gap ? gap[1] : el.className.indexOf('badge') >= 0 ? '10' : null;
+      if (!size) return;
+      var column = css.flexDirection === 'column';
+      for (var child = el.firstElementChild; child; child = child.nextElementSibling) {
+        if (!child.previousElementSibling) continue;
+        // The stage is RTL, so a row's next child sits to the left of the last.
+        child.style[column ? 'marginTop' : 'marginRight'] = size + 'px';
+      }
+    });
+  }
+
+  var MASK = '<svg viewBox="0 0 24 24" width="SZ" height="SZ"><path d="M3 6c5 2 13 2 18 0 1 7-2 13-9 13S2 13 3 6z"/><path d="M8 11h2M14 11h2M9 15c2 1.300 4 1.300 6 0"/></svg>';
+  var CHECK = '<svg viewBox="0 0 24 24" width="SZ" height="SZ"><path d="M5 13l4 4L19 7"/></svg>';
+  function icon(tpl, size) { return tpl.replace(/SZ/g, String(size)); }
+
+  function fit() {
+    var s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+    stage.style.transform = 'translate(' + (window.innerWidth - 1920 * s) / 2 + 'px,' + (window.innerHeight - 1080 * s) / 2 + 'px) scale(' + s + ')';
+  }
+  window.addEventListener('resize', fit);
+  fit();
+
+  // Everything that came from a player is user text: it only ever goes through
+  // this, never into a markup string unescaped.
+  function esc(value) {
+    return String(value == null ? '' : value).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  // The `anon` role may execute nothing (supabase/tests/grants_test.sql), so the
+  // TV signs in anonymously like the app. A new session on expiry costs nothing:
+  // everything this page reads is keyed by the TV code, not by who is asking.
+  // It is kept across reloads, because sign-ups are rate limited per address and
+  // a new user per page load would also leave a row behind every time.
+  var token = null;
+  function loadRefresh() {
+    try { return localStorage.getItem('bluff_tv_refresh'); } catch (e) { return null; }
+  }
+  function loadToken() {
+    try { return localStorage.getItem('bluff_tv_token'); } catch (e) { return null; }
+  }
+  function keep(j) {
+    token = j.access_token;
+    try {
+      localStorage.setItem('bluff_tv_token', j.access_token);
+      localStorage.setItem('bluff_tv_refresh', j.refresh_token);
+    } catch (e) {}
+    return token;
+  }
+  function auth(path, body) {
+    return fetch(cfg.url.replace(/\/$/, '') + '/auth/v1/' + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: cfg.anonKey },
+      body: JSON.stringify(body)
+    }).then(function (r) {
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    }).then(keep);
+  }
+  function session() {
+    if (token) return Promise.resolve(token);
+    var refresh = loadRefresh();
+    if (!refresh) return auth('signup', {});
+    return auth('token?grant_type=refresh_token', { refresh_token: refresh }).catch(function () {
+      return auth('signup', {});
+    });
+  }
+
+  function rpc(name, body) {
+    return session().then(function (t) { return rpcAs(t, name, body); });
+  }
+
+  function rpcAs(jwt, name, body) {
+    return fetch(cfg.url.replace(/\/$/, '') + '/rest/v1/rpc/' + name, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', apikey: cfg.anonKey, Authorization: 'Bearer ' + jwt },
+      body: JSON.stringify(body || {})
+    }).then(function (r) {
+      if (r.status === 401) {
+        token = null;
+        try { localStorage.removeItem('bluff_tv_token'); } catch (e) {}
+      }
+      if (!r.ok) throw new Error('http ' + r.status);
+      return r.json();
+    });
+  }
+
+  function storedCode() {
+    try {
+      var raw = JSON.parse(localStorage.getItem('bluff_tv') || 'null');
+      if (raw && raw.code && Date.now() - raw.at < CODE_TTL_MS) return raw;
+    } catch (e) {}
+    return null;
+  }
+  function storeCode(code) {
+    try { localStorage.setItem('bluff_tv', JSON.stringify({ code: code, at: Date.now() })); } catch (e) {}
+  }
+
+  var code = null;
+  var codeAt = 0;
+  var wasPaired = false;
+
+  function register() {
+    return rpc('bluff_tv_register').then(function (c) {
+      code = c;
+      codeAt = Date.now();
+      wasPaired = false;
+      storeCode(c);
+      renderCode();
+    });
+  }
+
+  function digits(n) {
+    return String(n).replace(/\d/g, function (d) { return '٠١٢٣٤٥٦٧٨٩'[+d]; });
+  }
+  function ordinal(n) {
+    return ['الأول','الثاني','الثالث','الرابع','الخامس','السادس','السابع','الثامن'][n - 1] || String(n);
+  }
+  function score(n) { return String(n).replace(/\B(?=(\d{3})+$)/g, ','); }
+  var SEATS = [['#D9534F','#F7F2E7'],['#3F9E5A','#F7F2E7'],['#E8B24A','#0A2C35'],['#3A7CA5','#F7F2E7'],['#D9822B','#0A2C35'],['#C2527F','#F7F2E7']];
+  function seat(name) {
+    var h = 0;
+    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) & 0x7fffffff;
+    return SEATS[h % SEATS.length];
+  }
+  // A player's face: their photo over the initial, so a photo that fails to
+  // load (offline, an expired provider URL) just leaves the initial showing.
+  // 0074 sends the URL; the server only stores Google-hosted ones (0035).
+  function avatar(name, size, dim, url) {
+    var c = dim ? ['#0F3E4A', '#F7F2E7'] : seat(name);
+    var photo = url && /^https:\/\//.test(url)
+      ? '<img alt="" referrerpolicy="no-referrer" onerror="this.remove()" style="position:absolute;top:0;left:0;width:100%;height:100%;border-radius:50%;object-fit:cover' +
+        (dim ? ';opacity:.45' : '') + '" src="' + esc(url) + '">'
+      : '';
+    return '<div class="lz" style="position:relative;width:' + size + 'px;height:' + size + 'px;border-radius:50%;background:' + c[0] + ';color:' + c[1] +
+      ';display:flex;align-items:center;justify-content:center;font-size:' + Math.round(size * 0.46) + 'px;flex:none">' + esc(Array.from(name)[0] || '؟') + photo + '</div>';
+  }
+  // The blue check the phones draw after an official account's name (0069).
+  var VERIFIED = '<svg viewBox="0 0 24 24" width="SZ" height="SZ" style="flex:none;vertical-align:middle;margin-right:.25em"><path fill="#1D9BF0" d="M22.5 12.5c0-1.58-.88-2.95-2.18-3.65.15-.44.23-.91.23-1.4 0-2.21-1.71-4-3.82-4-.47 0-.92.08-1.33.24C14.79 2.42 13.47 1.5 12 1.5s-2.79.92-3.4 2.19a3.7 3.7 0 0 0-1.33-.24c-2.11 0-3.82 1.79-3.82 4 0 .49.08.96.23 1.4-1.3.7-2.18 2.07-2.18 3.65 0 1.5.8 2.8 1.97 3.53-.04.21-.06.43-.06.65 0 2.21 1.71 4 3.82 4 .47 0 .92-.09 1.33-.25.6 1.28 1.93 2.17 3.44 2.17s2.84-.89 3.44-2.17c.41.16.86.25 1.33.25 2.11 0 3.82-1.79 3.82-4 0-.22-.02-.44-.06-.65 1.17-.73 1.97-2.03 1.97-3.53z"/><path fill="#fff" d="M10.54 16.2 6.8 12.46l1.41-1.41 2.33 2.33 5.24-5.24 1.41 1.41z"/></svg>';
+  function named(name, verified, size) {
+    return esc(name) + (verified ? icon(VERIFIED, size) : '');
+  }
+
+  function ring(s, total, size) {
+    var urgent = s <= 10;
+    var col = urgent ? 'var(--red)' : 'var(--gold)';
+    var pct = total > 0 ? Math.max(0, Math.min(100, (s / total) * 100)) : 0;
+    var inner = Math.round(size * 0.8);
+    var fill = hasConic ? 'conic-gradient(' + col + ' 0 ' + pct + '%,var(--card) ' + pct + '% 100%)' : col;
+    return '<div class="ring' + (urgent ? ' urgent' : '') + '" style="width:' + size + 'px;height:' + size + 'px;background:' + fill + '">' +
+      '<div class="ltr" style="width:' + inner + 'px;height:' + inner + 'px;display:flex;font-size:' + Math.round(size * 0.4) + 'px;color:' + (urgent ? 'var(--red)' : 'var(--coin)') + '">' + s + '</div></div>';
+  }
+
+  // bluff_tv_state does not send the phase length, so the arc's full circle is the
+  // most this phase has shown since it began.
+  var phaseKey = null, phaseMax = 0;
+  function totalFor(st, s) {
+    var key = st.status + ':' + st.round_no;
+    if (key !== phaseKey) { phaseKey = key; phaseMax = 0; }
+    phaseMax = Math.max(phaseMax, s);
+    return phaseMax;
+  }
+
+  function secondsLeft(st) {
+    if (!st.phase_ends) return 0;
+    var ms = new Date(st.phase_ends).getTime() - new Date(st.server_now).getTime() - (Date.now() - st._receivedAt);
+    return ms <= 0 ? 0 : Math.ceil(ms / 1000);
+  }
+
+  // QR-BEGIN: version 1-M, the same encoder as BluffQrCode in the app, which holds
+  // the 13 bytes of «bluff-tv:XXXX» (pairing) or the 10 of «bluff:XXXX» (joining). web_tv_page_test compares the two symbol by symbol.
+  function qrGf(x, y) {
+    var z = 0;
+    for (var i = 7; i >= 0; i--) {
+      z = (z << 1) ^ ((z >> 7) * 0x11D);
+      z ^= ((y >> i) & 1) * x;
+    }
+    return z & 0xFF;
+  }
+  function qrReedSolomon(data, ecLength) {
+    var divisor = [], result = [], root = 1, i, j;
+    for (i = 0; i < ecLength; i++) { divisor.push(0); result.push(0); }
+    divisor[ecLength - 1] = 1;
+    for (i = 0; i < ecLength; i++) {
+      for (j = 0; j < ecLength; j++) {
+        divisor[j] = qrGf(divisor[j], root);
+        if (j + 1 < ecLength) divisor[j] ^= divisor[j + 1];
+      }
+      root = qrGf(root, 2);
+    }
+    for (i = 0; i < data.length; i++) {
+      var factor = data[i] ^ result[0];
+      result.shift();
+      result.push(0);
+      for (j = 0; j < ecLength; j++) result[j] ^= qrGf(divisor[j], factor);
+    }
+    return result;
+  }
+  function qrFormatBits(mask) {
+    var rem = mask;
+    for (var i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >> 9) * 0x537);
+    return ((mask << 10) | rem) ^ 0x5412;
+  }
+  function qrMaskAt(mask, x, y) {
+    switch (mask) {
+      case 0: return (x + y) % 2 === 0;
+      case 1: return y % 2 === 0;
+      case 2: return x % 3 === 0;
+      case 3: return (x + y) % 3 === 0;
+      case 4: return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+      case 5: return (x * y) % 2 + (x * y) % 3 === 0;
+      case 6: return ((x * y) % 2 + (x * y) % 3) % 2 === 0;
+      default: return ((x + y) % 2 + (x * y) % 3) % 2 === 0;
+    }
+  }
+  function qrLine(cells) {
+    var s = 0, run = 1, i, j;
+    for (i = 1; i <= cells.length; i++) {
+      if (i < cells.length && cells[i] === cells[i - 1]) run++;
+      else { if (run >= 5) s += run - 2; run = 1; }
+    }
+    var a = [1, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0];
+    for (i = 0; i + 11 <= cells.length; i++) {
+      var ma = true, mb = true;
+      for (j = 0; j < 11; j++) {
+        if (cells[i + j] !== !!a[j]) ma = false;
+        if (cells[i + j] !== !!a[10 - j]) mb = false;
+      }
+      if (ma) s += 40;
+      if (mb) s += 40;
+    }
+    return s;
+  }
+  function qrPenalty(m) {
+    var n = m.length, score = 0, dark = 0, x, y;
+    for (var i = 0; i < n; i++) {
+      var col = [];
+      for (y = 0; y < n; y++) col.push(m[y][i]);
+      score += qrLine(m[i]) + qrLine(col);
+    }
+    for (y = 0; y < n; y++) {
+      for (x = 0; x < n; x++) {
+        if (m[y][x]) dark++;
+        if (x + 1 < n && y + 1 < n && m[y][x] === m[y][x + 1] && m[y][x] === m[y + 1][x] && m[y][x] === m[y + 1][x + 1]) score += 3;
+      }
+    }
+    return score + Math.floor(Math.abs(Math.floor(dark * 100 / (n * n)) - 50) / 5) * 10;
+  }
+  function qrMatrix(text) {
+    var n = 21, capacity = 16, bits = [], i, x, y;
+    function put(value, count) { for (var b = count - 1; b >= 0; b--) bits.push((value >> b) & 1); }
+    put(4, 4);
+    put(text.length, 8);
+    for (i = 0; i < text.length; i++) put(text.charCodeAt(i), 8);
+    var room = capacity * 8 - bits.length;
+    put(0, room < 4 ? room : 4);
+    while (bits.length % 8) bits.push(0);
+    var words = [];
+    for (i = 0; i < bits.length; i += 8) {
+      var v = 0;
+      for (var j = 0; j < 8; j++) v = (v << 1) | bits[i + j];
+      words.push(v);
+    }
+    for (var pad = 0xEC; words.length < capacity; pad ^= 0xEC ^ 0x11) words.push(pad);
+    words = words.concat(qrReedSolomon(words, 10));
+
+    var m = [], reserved = [];
+    for (y = 0; y < n; y++) {
+      m.push([]); reserved.push([]);
+      for (x = 0; x < n; x++) { m[y].push(false); reserved[y].push(false); }
+    }
+    function set(cx, cy, dark) { m[cy][cx] = dark; reserved[cy][cx] = true; }
+    function format(mask) {
+      var f = qrFormatBits(mask), k;
+      function bit(b) { return ((f >> b) & 1) === 1; }
+      for (k = 0; k <= 5; k++) set(8, k, bit(k));
+      set(8, 7, bit(6)); set(8, 8, bit(7)); set(7, 8, bit(8));
+      for (k = 9; k < 15; k++) set(14 - k, 8, bit(k));
+      for (k = 0; k < 8; k++) set(n - 1 - k, 8, bit(k));
+      for (k = 8; k < 15; k++) set(8, n - 15 + k, bit(k));
+      set(8, n - 8, true);
+    }
+    function finder(cx, cy) {
+      for (var dy = -4; dy <= 4; dy++) {
+        for (var dx = -4; dx <= 4; dx++) {
+          var px = cx + dx, py = cy + dy;
+          if (px < 0 || py < 0 || px >= n || py >= n) continue;
+          var d = Math.max(Math.abs(dx), Math.abs(dy));
+          set(px, py, d !== 2 && d !== 4);
+        }
+      }
+    }
+    for (i = 0; i < n; i++) { set(6, i, i % 2 === 0); set(i, 6, i % 2 === 0); }
+    finder(3, 3); finder(n - 4, 3); finder(3, n - 4);
+    format(0);
+
+    var total = words.length * 8;
+    i = 0;
+    for (var right = n - 1; right >= 1; right -= 2) {
+      if (right === 6) right = 5;
+      for (var vert = 0; vert < n; vert++) {
+        for (var c = 0; c < 2; c++) {
+          x = right - c;
+          y = ((right + 1) & 2) === 0 ? n - 1 - vert : vert;
+          if (!reserved[y][x] && i < total) {
+            m[y][x] = ((words[i >> 3] >> (7 - (i & 7))) & 1) === 1;
+            i++;
+          }
+        }
+      }
+    }
+
+    function masked(mask) {
+      for (var my = 0; my < n; my++) {
+        for (var mx = 0; mx < n; mx++) {
+          if (!reserved[my][mx] && qrMaskAt(mask, mx, my)) m[my][mx] = !m[my][mx];
+        }
+      }
+      format(mask);
+    }
+    var best = 0, bestPenalty = -1;
+    for (var t = 0; t < 8; t++) {
+      masked(t);
+      var p = qrPenalty(m);
+      if (bestPenalty < 0 || p < bestPenalty) { bestPenalty = p; best = t; }
+      masked(t); // Undoes the data; format() is rewritten by the next mask.
+    }
+    masked(best);
+    return m;
+  }
+  // QR-END
+
+  // Dark on white with its quiet zone, because a scanner does not read a theme.
+  function drawQr(canvas, text) {
+    var m = qrMatrix(text), quiet = 4, cell = Math.floor(canvas.width / (m.length + quiet * 2));
+    var offset = Math.floor((canvas.width - cell * m.length) / 2);
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#000000';
+    for (var y = 0; y < m.length; y++) {
+      for (var x = 0; x < m.length; x++) {
+        if (m[y][x]) ctx.fillRect(offset + x * cell, offset + y * cell, cell, cell);
+      }
+    }
+  }
+
+  function renderCode() {
+    stage.innerHTML = '<div class="center"><div class="lz" style="font-size:84px">فبركة</div>' +
+      '<div style="margin-top:24px;font:600 40px Cairo,sans-serif;color:var(--m70)">امسح الرمز أو أدخله على هاتف المضيف</div>' +
+      '<div class="row" style="margin-top:48px">' +
+      '<canvas id="tv-qr" width="464" height="464" style="width:464px;height:464px;border-radius:32px;flex:none"></canvas>' +
+      '<div class="lz ltr" style="margin-right:96px;font-size:200px;letter-spacing:24px;color:var(--coin)">' + esc(code) + '</div></div></div>';
+    drawQr(document.getElementById('tv-qr'), 'bluff-tv:' + code);
+  }
+
+  function renderSetup() {
+    stage.innerHTML = '<div class="center"><div style="font:700 44px Cairo,sans-serif">لم تُضبط إعدادات الخادم بعد</div>' +
+      '<div class="ltr" style="margin-top:20px;font:400 30px Cairo,sans-serif;color:var(--m60)">BLUFF_TV_CONFIG: url, anonKey</div></div>';
+  }
+
+  // The room the phones are in, at TV scale: how to join, what will be asked and
+  // who is here. A server older than 0061 sends no categories and no ready flags;
+  // those parts are simply absent.
+  // Bluff's lobby lists the room's categories; a board room the columns the
+  // teams have picked so far; an acting room its word categories, or all.
+  var MODES = { board: 'اللوحة', acting: 'مثّلها' };
+  function lobbyCategories(st) {
+    if (st.mode === 'board') return ((st.board || {}).picks || []).map(function (p) { return p.name; });
+    if (st.mode === 'acting') {
+      var picked = (st.acting || {}).picked || [];
+      return picked.length ? picked : ['كل الفئات'];
+    }
+    return st.categories || [];
+  }
+  function renderLobby(st) {
+    var players = st.players || [];
+    var cats = lobbyCategories(st);
+    var ready = players.filter(function (p) { return p.ready; }).length;
+    var compact = players.length > 6;
+    var size = compact ? 72 : 96;
+    var rows = players.map(function (p) {
+      var name = p.name || '';
+      return '<div class="row" style="width:' + (compact ? '50%' : '100%') + ';height:' + (compact ? 128 : 136) + 'px;padding:0 12px">' + avatar(name, size, false, p.avatar_url) +
+        (st.uses_teams && p.team ? '<span style="margin-right:14px">' + teamMark(p.team, compact ? 40 : 50) + '</span>' : '') +
+        '<span style="flex:1;min-width:0;margin-right:20px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font:700 ' + (compact ? 32 : 42) + 'px Cairo,sans-serif">' + named(name, p.verified, compact ? 30 : 38) + '</span>' +
+        (p.ready ? '<span class="row" style="flex:none;margin-right:12px;color:var(--truth);font:700 ' + (compact ? 26 : 32) + 'px Cairo,sans-serif">' + icon(CHECK, compact ? 30 : 38) + '<span style="margin-right:6px">جاهز</span></span>' : '') + '</div>';
+    }).join('');
+    // The pool has no ceiling, so every name is drawn; a long one gets smaller chips.
+    var dense = cats.length > 12;
+    var chips = cats.map(function (name) {
+      return '<span style="margin:0 0 ' + (dense ? 10 : 14) + 'px ' + (dense ? 10 : 14) + 'px;padding:' + (dense ? '6px 18px' : '10px 26px') +
+        ';border-radius:999px;background:var(--canvas);font:700 ' + (dense ? 24 : 30) + 'px Cairo,sans-serif">' + esc(name) + '</span>';
+    }).join('');
+    var seats = players.length + (st.max_seats ? '/' + st.max_seats : '');
+    stage.innerHTML = '<div style="display:flex;gap:40px;padding:56px 72px;height:1080px">' +
+      '<div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:32px">' +
+        '<div class="row" style="flex:none;gap:28px;min-width:0"><div class="lz" style="flex:1;min-width:0;font-size:72px;line-height:1.2;overflow:hidden;white-space:nowrap;text-overflow:ellipsis">' + esc(st.name) + '</div>' +
+          (MODES[st.mode] ? '<span class="pill" style="color:var(--coin)">' + MODES[st.mode] + '</span>' : '') + '</div>' +
+        '<div class="card row" style="flex:none;gap:44px"><canvas id="tv-join-qr" width="290" height="290" style="width:290px;height:290px;border-radius:24px;flex:none"></canvas>' +
+          '<div><div style="font:700 34px Cairo,sans-serif;color:var(--m70)">امسح الرمز أو انضم بالرمز</div>' +
+          '<div class="lz ltr" style="margin-top:12px;font-size:130px;line-height:1.1;letter-spacing:14px;color:var(--coin)">' + esc(st.code) + '</div></div></div>' +
+        (cats.length ? '<div id="lobby-cats" class="card" style="flex:none;padding-bottom:16px;transform-origin:top right"><div style="margin-bottom:20px;font:700 34px Cairo,sans-serif">الفئات</div><div style="display:flex;flex-wrap:wrap">' + chips + '</div></div>' : '') +
+      '</div>' +
+      '<div class="card" style="flex:1;min-width:0;border-radius:40px;padding:40px"><div class="row" style="margin-bottom:24px"><span class="lz" style="flex:1;font-size:50px">اللاعبون <span class="ltr">' + seats + '</span></span>' +
+        (ready ? '<span style="color:var(--truth);font:700 32px Cairo,sans-serif">جاهزون: <span class="ltr">' + ready + '</span></span>' : '') + '</div>' +
+        '<div style="display:flex;flex-wrap:wrap">' + rows + '</div></div></div>';
+    drawQr(document.getElementById('tv-join-qr'), 'bluff:' + st.code);
+    // Every category the host picked shows, however many: a long pool shrinks to
+    // fit under the code rather than running off the screen.
+    var box = document.getElementById('lobby-cats');
+    if (box) {
+      var room = 1024 - box.offsetTop;
+      if (box.offsetHeight > room) box.style.transform = 'scale(' + room / box.offsetHeight + ')';
+    }
+  }
+
+  // The door is shut by now (joining needs the lobby), so no join code here.
+  function renderCountdown(st) {
+    var s = secondsLeft(st);
+    stage.innerHTML = '<div class="center"><div class="lz" style="font-size:84px">' + esc(st.name) + '</div>' +
+      '<div style="margin:32px 0 48px;font:700 44px Cairo,sans-serif;color:var(--m70)">تبدأ اللعبة بعد</div>' + ring(s, totalFor(st, s), 340) + '</div>';
+  }
+
+  // A player chooses this round's category on their phone. The board never gets the
+  // offer, only who is choosing and then what they chose.
+  function renderPicking(st) {
+    var s = secondsLeft(st);
+    var name = st.picker_name || '';
+    var head = '<div class="row" style="gap:28px;padding:48px 72px"><span class="pill">الجولة ' + st.round_no + ' من ' + st.rounds + '</span><span style="flex:1"></span>' +
+      (st.pick_category ? '' : ring(s, totalFor(st, s), 150)) + '</div>';
+    stage.innerHTML = head + (st.pick_category
+      ? '<div class="center" style="margin-top:80px"><div style="font:700 44px Cairo,sans-serif;color:var(--m70)">اختيار ' + named(name, st.picker_verified, 40) + '</div>' +
+        '<div class="lz" style="margin-top:28px;font-size:120px;color:var(--coin)">' + esc(st.pick_category) + '</div>' +
+        '<div style="margin-top:28px;font:700 40px Cairo,sans-serif;color:var(--m70)">استعدوا للسؤال…</div></div>'
+      : '<div class="center" style="margin-top:80px">' + avatar(name, 180, false, st.picker_avatar_url) + '<div class="lz" style="margin-top:32px;font-size:96px">دور ' + named(name, st.picker_verified, 80) + '</div>' +
+        '<div style="margin-top:20px;font:700 44px Cairo,sans-serif;color:var(--m70)">يختار فئة هذه الجولة من هاتفه</div></div>');
+  }
+
+  function renderWriting(st) { // 1l
+    var s = secondsLeft(st);
+    var list = st.players || [];
+    // The strip is one row in the page's flow, never laid over the question: each
+    // face gets an equal share of the width, and a full room gets smaller faces.
+    var n = Math.max(1, list.length);
+    var size = n <= 6 ? 100 : n <= 8 ? 84 : 68;
+    var cell = Math.min(220, Math.floor((1776 - (n - 1) * 16) / n));
+    var players = list.map(function (p) {
+      var name = p.name || '';
+      var dot = Math.round(size * 0.4);
+      var mark = p.wrote ? '<i style="position:absolute;bottom:-4px;left:-4px;width:' + dot + 'px;height:' + dot + 'px;border-radius:50%;background:var(--truth);display:flex;align-items:center;justify-content:center;border:4px solid var(--canvas)">' + icon(CHECK, Math.round(dot / 2)) + '</i>' : '';
+      return '<div style="flex:none;width:' + cell + 'px;text-align:center"><div style="position:relative;width:' + size + 'px;margin:auto">' + avatar(name, size, !p.wrote, p.avatar_url) + mark + '</div>' +
+        '<div style="margin-top:10px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font:700 24px Cairo,sans-serif;color:' + (p.wrote ? 'var(--ink)' : 'var(--m60)') + '">' + named(name, p.verified, 22) + '</div>' +
+        '<div style="font:600 22px Cairo,sans-serif;color:' + (p.wrote ? 'var(--truth)' : 'var(--m60)') + '">' + (p.wrote ? 'كتب' : 'يكتب…') + '</div></div>';
+    }).join('');
+    stage.innerHTML = '<div style="display:flex;flex-direction:column;height:1080px">' +
+      '<div class="row" style="flex:none;gap:28px;padding:48px 72px 0"><span class="pill">الجولة ' + st.round_no + ' من ' + st.rounds + '</span><span style="flex:1"></span>' +
+      '<span style="font:600 28px Cairo,sans-serif;color:var(--m60)">انضم: <b class="lz ltr" style="font-size:44px;color:var(--coin);letter-spacing:6px">' + esc(st.code) + '</b></span>' + ring(s, totalFor(st, s), 150) + '</div>' +
+      '<div id="w-main" style="flex:1;min-height:0;overflow:hidden;display:flex;align-items:center;justify-content:center;padding:0 160px">' +
+        '<div id="w-body" style="width:100%;text-align:center">' +
+          '<div style="font:700 30px Cairo,sans-serif;color:var(--coin)">السؤال</div>' + questionImage(st, 280) + '<div class="lz" style="margin-top:16px;font-size:' + (st.image ? 56 : 84) + 'px;line-height:1.35">' + esc(st.question) + '</div>' +
+          '<div style="margin-top:40px;display:flex;justify-content:center"><div class="row" style="gap:18px;padding:22px 40px;border-radius:999px;background:var(--lie);font:700 36px Cairo,sans-serif">' + icon(MASK, 44) + 'اكتبوا إجاباتكم على هواتفكم</div></div>' +
+        '</div></div>' +
+      '<div class="row" style="flex:none;justify-content:center;gap:16px;padding:24px 72px 44px">' + players + '</div></div>';
+    // A picture and a long question can outgrow the space between the header and
+    // the faces; shrink it to fit rather than run under them.
+    var main = document.getElementById('w-main');
+    var body = document.getElementById('w-body');
+    var img = body.querySelector('img');
+    function shrink() {
+      body.style.transform = '';
+      if (body.offsetHeight > main.clientHeight) body.style.transform = 'scale(' + main.clientHeight / body.offsetHeight + ')';
+    }
+    shrink();
+    if (img && !img.complete) img.addEventListener('load', shrink);
+  }
+
+  function renderChoosing(st) { // 1m
+    var s = secondsLeft(st);
+    var options = st.options || [];
+    var h = options.length > 6 ? 118 : 170;
+    var cells = options.map(function (body, i) {
+      return '<div class="row" style="height:' + h + 'px;border-radius:32px;background:var(--card);gap:26px;padding:0 34px">' +
+        '<span class="lz" style="width:84px;height:84px;border-radius:24px;background:var(--gold);color:var(--canvas);display:flex;align-items:center;justify-content:center;font-size:50px;flex:none">' + digits(i + 1) + '</span>' +
+        '<span class="lz" style="font-size:52px">' + esc(body) + '</span></div>';
+    }).join('');
+    stage.innerHTML = '<div class="row" style="gap:28px;padding:48px 72px"><span class="lz" style="font-size:56px;flex:1">أيّها الحقيقة؟</span>' +
+      '<span style="font:600 30px Cairo,sans-serif;color:var(--m60)">اختار ' + (st.chosen || 0) + ' من ' + (st.players || []).length + '</span>' + ring(s, totalFor(st, s), 130) + '</div>' +
+      '<div class="lz" style="margin:0 72px;padding:22px 34px;border-radius:28px;background:var(--card);font-size:46px;text-align:center">' + questionImage(st, 170) + esc(st.question) + '</div>' +
+      '<div style="margin:40px 72px 0;display:grid;grid-template-columns:1fr 1fr 1fr;gap:28px">' + cells + '</div>' +
+      '<div style="position:absolute;bottom:48px;left:72px;right:72px;text-align:center;font:600 30px Cairo,sans-serif;color:rgba(247,242,231,.55)">اختر من هاتفك</div>';
+  }
+
+  function renderReveal(st) { // 1n
+    var multiplier = st.round_no >= st.rounds ? 2 : 1;
+    var lies = (st.reveal || []).map(function (l, i) {
+      var author = l.author || '';
+      var fooled = l.fooled || [];
+      var ringCss = i === 0 ? 'box-shadow:inset 0 0 0 6px var(--lie);' : '';
+      return '<div class="card" style="' + ringCss + '"><div class="row" style="gap:22px"><span class="badge" style="background:var(--lie)">' + icon(MASK, 34) + 'إجابة ' + esc(author) + '</span>' +
+        '<span class="lz" style="font-size:58px">' + esc(l.body) + '</span></div>' +
+        '<div style="margin-top:14px;font:600 30px Cairo,sans-serif;color:var(--m70)">' +
+        (fooled.length ? 'صدّقها: ' + fooled.map(esc).join('، ') + ' <b style="color:var(--coin)"><span class="ltr">+' + (500 * multiplier * fooled.length) + '</span> ل' + esc(author) + '</b>' : 'لم يصدّقها أحد') +
+        '</div></div>';
+    }).join('');
+    var found = st.found_truth || [];
+    var truth = '<div class="card truth-pulse" style="box-shadow:inset 0 0 0 6px var(--truth)"><div class="row" style="gap:22px"><span class="badge" style="background:var(--truth)">' + icon(CHECK, 32) + 'الحقيقة</span>' +
+      '<span class="lz" style="font-size:66px">' + esc(st.truth) + '</span></div>' +
+      '<div style="margin-top:18px;font:600 32px Cairo,sans-serif;color:var(--m70)">' +
+      (found.length ? 'وجدها: ' + found.map(esc).join('، ') + ' <b class="ltr" style="color:var(--truth)">+' + (1000 * multiplier) + '</b>' : 'لم يجدها أحد') + '</div></div>';
+    var rows = (st.players || []).map(function (p, i) {
+      var first = i === 0;
+      return '<div class="row" style="gap:22px;padding:20px 26px;border-radius:26px;background:var(--canvas);' + (first ? 'box-shadow:inset 0 0 0 4px var(--gold)' : '') + '">' +
+        '<span class="lz" style="font-size:38px;color:' + (first ? 'var(--coin)' : 'var(--m60)') + ';width:130px">' + ordinal(i + 1) + '</span>' + avatar(p.name || '', 76, false, p.avatar_url) +
+        '<span style="flex:1;font:700 36px Cairo,sans-serif">' + named(p.name || '', p.verified, 32) + '</span><span class="lz ltr" style="font-size:46px">' + score(p.score || 0) + '</span></div>';
+    }).join('');
+    stage.innerHTML = '<div style="display:flex;gap:40px;padding:56px 72px;height:1080px;overflow:hidden">' +
+      '<div id="left" style="flex:1.35;display:flex;flex-direction:column;gap:26px;transform-origin:top right"><div class="lz" style="font-size:56px">الكشف</div>' + lies + truth + '</div>' +
+      '<div style="flex:1;border-radius:40px;background:var(--card);padding:40px;overflow:hidden"><div id="right" style="display:flex;flex-direction:column;gap:18px;transform-origin:top right"><div class="lz" style="font-size:50px;margin-bottom:6px">الترتيب</div>' + rows + '</div></div></div>';
+    // A big room overflows the frame's three cards; shrink rather than clip.
+    ['left', 'right'].forEach(function (id) {
+      var el = document.getElementById(id);
+      var room = id === 'left' ? 968 : 888;
+      if (el.scrollHeight > room) el.style.transform = 'scale(' + room / el.scrollHeight + ')';
+    });
+  }
+
+  // The bucket is public; the path comes from a staff-written row and is still escaped.
+  function questionImage(st, height) {
+    if (!st.image) return '';
+    return '<div style="margin:16px 0;text-align:center"><img alt="" style="height:' + height + 'px;max-width:100%;border-radius:16px" src="' +
+      esc(cfg.url + '/storage/v1/object/public/bluff-images/' + st.image) + '"></div>';
+  }
+
+  function renderFinal(st) { // the phone's 1j at TV scale
+    var players = st.players || [];
+    var top = players.length ? players[0].score : 0;
+    var winners = players.filter(function (p) { return p.score === top; });
+    var names = winners.map(function (p) { return esc(p.name); }).join('، ');
+    var heights = [300, 230, 170];
+    function step(i) {
+      var p = players[i];
+      if (!p) return '<div style="flex:1"></div>';
+      var first = i === 0;
+      return '<div style="flex:1;text-align:center"><div style="display:flex;justify-content:center">' + avatar(p.name || '', first ? 170 : 130, false, p.avatar_url) + '</div>' +
+        '<div style="margin:14px 0;font:700 ' + (first ? 40 : 34) + 'px Cairo,sans-serif">' + named(p.name || '', p.verified, first ? 36 : 30) + '</div>' +
+        '<div style="height:' + heights[i] + 'px;padding-top:24px;border-radius:32px 32px 0 0;background:' + (first ? 'var(--gold)' : 'var(--card)') + ';color:' + (first ? 'var(--canvas)' : 'var(--ink)') + '">' +
+        '<div class="lz" style="font-size:' + (first ? 64 : 50) + 'px">' + ordinal(i + 1) + '</div>' +
+        '<div class="lz ltr" style="font-size:' + (first ? 46 : 38) + 'px">' + score(p.score || 0) + '</div></div></div>';
+    }
+    var rest = players.slice(3).map(function (p, i) {
+      return '<div class="row" style="gap:16px;padding:12px 26px;border-radius:999px;background:var(--card);font:700 28px Cairo,sans-serif">' +
+        '<span style="color:var(--m60)">' + ordinal(i + 4) + '</span>' + named(p.name || '', p.verified, 26) + ' <span class="lz ltr" style="color:var(--coin)">' + score(p.score || 0) + '</span></div>';
+    }).join('');
+    // The rest of the table sits under the podium in the flow, not over it; a big
+    // room shrinks the podium to make the room.
+    stage.innerHTML = '<div style="display:flex;flex-direction:column;height:1080px">' +
+      '<div style="flex:none;padding:44px 160px 0;text-align:center"><div class="lz" style="font-size:96px;color:var(--coin)">سيد المجلس!</div>' +
+      '<div class="lz" style="margin-top:6px;font-size:60px">' + names + '</div></div>' +
+      '<div id="f-main" style="flex:1;min-height:0;overflow:hidden;display:flex;align-items:flex-end;justify-content:center;margin-top:30px">' +
+        '<div id="f-podium" style="display:flex;align-items:flex-end;gap:32px;width:1320px;transform-origin:bottom center">' + step(1) + step(0) + step(2) + '</div></div>' +
+      (rest ? '<div class="row" style="flex:none;justify-content:center;flex-wrap:wrap;gap:18px;padding:28px 72px 36px">' + rest + '</div>' : '<div style="flex:none;height:56px"></div>') + '</div>';
+    var main = document.getElementById('f-main');
+    var podium = document.getElementById('f-podium');
+    if (podium.offsetHeight > main.clientHeight) podium.style.transform = 'scale(' + main.clientHeight / podium.offsetHeight + ')';
+  }
+
+  // ---------------------------------------------------------------------------
+  // The party modes (0091). The phones' wording, at TV scale. A team is a
+  // colour AND a numeral AND a shape, as BluffTeamMark draws it; the fifth
+  // team is the app's inkTeal, which is this page's card colour, so here it is
+  // the seats' blue.
+  var TEAMS = [['#E8B24A', '#0A2C35'], ['#D9534F', '#F7F2E7'], ['#3F9E5A', '#F7F2E7'], ['#8E4EC6', '#F7F2E7'], ['#3A7CA5', '#F7F2E7'], ['#F7F2E7', '#0A2C35']];
+  function polygon(sides, start) {
+    var pts = [];
+    for (var i = 0; i < sides; i++) {
+      var a = start + i * 2 * Math.PI / sides;
+      pts.push((50 + 50 * Math.cos(a)).toFixed(1) + ',' + (50 + 50 * Math.sin(a)).toFixed(1));
+    }
+    return '<polygon points="' + pts.join(' ') + '"/>';
+  }
+  function teamMark(team, size) {
+    var i = Math.max(0, Math.min(5, (team || 1) - 1));
+    var shape = [
+      '<circle cx="50" cy="50" r="50"/>',
+      '<rect width="100" height="100" rx="20"/>',
+      polygon(3, -Math.PI / 2),
+      polygon(4, 0),
+      polygon(6, 0),
+      polygon(5, -Math.PI / 2)
+    ][i];
+    return '<span style="position:relative;display:inline-flex;align-items:center;justify-content:center;width:' + size + 'px;height:' + size + 'px;flex:none;vertical-align:middle">' +
+      '<svg viewBox="0 0 100 100" width="' + size + '" height="' + size + '" style="position:absolute;top:0;left:0;stroke:none;fill:' + TEAMS[i][0] + '">' + shape + '</svg>' +
+      '<span class="lz" style="position:relative;font-size:' + Math.round(size * 0.5) + 'px;color:' + TEAMS[i][1] + (i === 2 ? ';margin-top:' + Math.round(size * 0.18) + 'px' : '') + '">' + digits(i + 1) + '</span></span>';
+  }
+  function teamName(team) { return 'الفريق ' + digits(team); }
+  function teamScores(list, size) { // [{team, score}], highest first stays the server's team order
+    return (list || []).map(function (t) {
+      return '<span class="row" style="gap:16px;padding:12px 28px 12px 18px;border-radius:999px;background:var(--card)">' + teamMark(t.team, size) +
+        '<span class="lz ltr" style="font-size:' + Math.round(size * 0.8) + 'px;color:var(--coin)">' + score(t.score || 0) + '</span></span>';
+    }).join('');
+  }
+  // The teams' scores get a row of their own under the top bar, in the flow,
+  // so the screen below starts after them: pinned to the bottom they sat on
+  // the board's last row and on the actor's prompt.
+  var SCORES_H = 96;
+  function scoresRow(list) {
+    return '<div class="row" style="justify-content:center;gap:24px;height:' + SCORES_H + 'px">' + teamScores(list, 52) + '</div>';
+  }
+  // A solo game's standings in the same row: the leaders' faces and points.
+  function playerScores(players) {
+    return '<div class="row" style="justify-content:center;gap:20px;height:' + SCORES_H + 'px">' +
+      (players || []).slice().sort(function (x, y) { return (y.score || 0) - (x.score || 0); }).slice(0, 6).map(function (p) {
+        return '<span class="row" style="gap:14px;padding:8px 26px 8px 8px;border-radius:999px;background:var(--card)">' + avatar(p.name || '', 56, false, p.avatar_url) +
+          '<span style="max-width:200px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font:700 30px Cairo,sans-serif">' + esc(p.name || '') + '</span>' +
+          '<span class="lz ltr" style="font-size:40px;color:var(--coin)">' + score(p.score || 0) + '</span></span>';
+      }).join('') + '</div>';
+  }
+  // Shrinks a block that outgrew the height left for it, rather than letting it
+  // run off the screen or under something else.
+  function fitHeight(box, room) {
+    if (box.offsetHeight > room) box.style.transform = 'scale(' + room / box.offsetHeight + ')';
+  }
+  function topBar(st, title, timer) {
+    var s = secondsLeft(st);
+    return '<div class="row" style="gap:28px;padding:44px 72px 0;height:190px"><div style="flex:1;min-width:0">' + title + '</div>' +
+      (timer ? ring(s, totalFor(st, s), 140) : '') + '</div>';
+  }
+
+  // «اللوحة»: the grid while a team picks, the live question after.
+  function renderBoard(st) {
+    var b = st.board || {};
+    var live = b.live;
+    var turn = b.turn ? '<span class="row" style="gap:18px">' + teamMark(b.turn, 64) + '<span class="lz" style="font-size:64px">دور ' + teamName(b.turn) + '</span></span>' : '';
+    var scores = scoresRow(b.scores);
+    if (st.status === 'board_pick' || !live) {
+      var cells = b.cells || [];
+      var cell = function (x, height, extra) {
+        var done = x.state === 'done';
+        var body = done
+          ? (x.won_by ? teamMark(x.won_by, 64) : '<span style="font:700 34px Cairo,sans-serif;color:var(--m60)">—</span>')
+          : '<span class="lz ltr" style="font-size:58px;color:var(--coin)">' + x.value + '</span>';
+        return '<div class="row" style="justify-content:center;height:' + height + 'px;border-radius:24px;' + (extra || '') + 'background:' + (done ? 'rgba(15,62,74,.45)' : 'var(--card)') + '">' + body + '</div>';
+      };
+      var grid = b.layout === 'split' ? splitGrid(b, cells, cell) : '<div class="row" style="align-items:flex-start;padding:0 64px">' + (b.columns || []).map(function (c) {
+        var rows = cells.filter(function (x) { return x.col === c.col; }).sort(function (x, y) { return x.row - y.row; }).map(function (x) {
+          return cell(x, 112, 'margin-top:14px;');
+        }).join('');
+        return '<div style="flex:1;min-width:0;margin:0 8px"><div class="row" style="justify-content:center;height:96px;padding:0 14px;border-radius:24px;background:var(--card);text-align:center;font:700 32px Cairo,sans-serif;line-height:1.15;overflow:hidden">' + esc(c.name) + '</div>' + rows + '</div>';
+      }).join('') + '</div>';
+      var armed = b.armed ? '<span class="badge" style="background:var(--gold);color:var(--canvas)">الخانة القادمة مضاعفة</span>' : '';
+      stage.innerHTML = topBar(st, '<div class="row" style="gap:28px">' + turn + armed + '</div>', st.status === 'board_pick') + scores +
+        '<div id="b-grid" style="transform-origin:top center">' + grid + '</div>';
+      var box = document.getElementById('b-grid');
+      fitHeight(box, 1056 - box.offsetTop);
+      return;
+    }
+    var reveal = st.status === 'board_reveal';
+    var points = (live.value || 0) * (live.doubled ? 2 : 1);
+    var head = '<div class="row" style="justify-content:center;gap:22px;margin-bottom:28px"><span class="pill">' + esc(columnName(b, live.col)) + '</span>' +
+      '<span class="pill lz ltr" style="color:var(--coin);font-size:40px">' + points + '</span>' +
+      (live.doubled ? '<span class="badge" style="background:var(--gold);color:var(--canvas)">مضاعفة</span>' : '') + '</div>';
+    var line = st.status === 'board_question' ? 'جاوبوا بصوت عالٍ، والحَكَم يقرّر' : st.status === 'board_judge' ? 'الحَكَم يراجع الإجابات' : '';
+    var answer = reveal
+      ? '<div class="card" style="margin-top:36px;box-shadow:inset 0 0 0 6px var(--truth);text-align:center"><div style="font:700 32px Cairo,sans-serif;color:var(--truth)">الإجابة</div>' +
+        '<div class="lz" style="margin-top:6px;font-size:76px">' + esc(live.answer) + '</div></div>' +
+        '<div class="row" style="justify-content:center;gap:18px;margin-top:30px;font:700 44px Cairo,sans-serif">' +
+        (live.won_by ? teamMark(live.won_by, 60) + '<span>أخذها ' + teamName(live.won_by) + '</span> <span class="lz ltr" style="color:var(--coin)">+' + points + '</span>' : '<span style="color:var(--m70)">لم يأخذها أحد</span>') + '</div>'
+      : '<div style="margin-top:36px;text-align:center;font:700 40px Cairo,sans-serif;color:var(--m70)">' + line + '</div>';
+    stage.innerHTML = topBar(st, turn, !reveal) + scores +
+      '<div id="b-live" style="padding:10px 160px 0;transform-origin:top center">' + head +
+        '<div id="b-q" class="lz" style="padding:34px 44px;border-radius:32px;background:var(--card);text-align:center;font-size:62px;line-height:1.35">' + questionImage(live, 220) + esc(live.question) + '</div>' +
+        answer + '</div>';
+    // A long question with a picture and its answer can outgrow the room under
+    // the scores: shrink it to fit, as the lobby's categories do.
+    var box = document.getElementById('b-live');
+    fitHeight(box, 1048 - box.offsetTop);
+  }
+  // The split board (0094), as the phones draw it: a line per category, its
+  // name between the halves, team 1's half on the right, each half from its
+  // 200 at the edge to its 600 by the name. The half not on turn is dimmed.
+  function splitGrid(b, cells, cell) {
+    var half = function (line, side) {
+      var mine = cells.filter(function (x) { return x.side === side && x.line === line; }).sort(function (x, y) { return x.row - y.row; });
+      if (side === 2) mine.reverse();
+      return '<div class="row" style="flex:1;min-width:0;gap:14px;opacity:' + (side === b.turn ? 1 : 0.55) + '">' +
+        mine.map(function (x) { return '<div style="flex:1;min-width:0">' + cell(x, 96) + '</div>'; }).join('') + '</div>';
+    };
+    var head = function (side) {
+      return '<div class="row" style="flex:1;justify-content:center;gap:16px;font:700 36px Cairo,sans-serif;color:' + (side === b.turn ? 'var(--coin)' : 'var(--m60)') + '">' + teamMark(side, 48) + teamName(side) + '</div>';
+    };
+    var NAME = 300;
+    return '<div style="padding:0 64px"><div class="row" style="height:64px">' + head(1) + '<div style="width:' + NAME + 'px"></div>' + head(2) + '</div>' +
+      (b.columns || []).map(function (c) {
+        return '<div class="row" style="margin-top:14px">' + half(c.col, 1) +
+          '<div class="row" style="width:' + NAME + 'px;height:96px;justify-content:center;padding:0 18px;text-align:center;font:700 34px Cairo,sans-serif;line-height:1.15;overflow:hidden">' + esc(c.name) + '</div>' +
+          half(c.col, 2) + '</div>';
+      }).join('') + '</div>';
+  }
+  function columnName(b, col) {
+    // A split board's side-2 cell sits in column line + 6: its line names it.
+    var cell = (b.cells || []).filter(function (x) { return x.col === col; })[0];
+    var line = cell && cell.line ? cell.line : col;
+    var c = (b.columns || []).filter(function (x) { return x.col === line; })[0];
+    return c ? c.name : '';
+  }
+
+  // «مثّلها»: who acts and the category. The word only at the reveal: the
+  // server sends nothing before it.
+  function renderActing(st) {
+    var a = st.acting || {};
+    var name = a.actor_name || '';
+    // The view names the actor but carries no id: their seat is the one player
+    // with that name (on that team). Two alike and neither face is guessed.
+    var alike = (st.players || []).filter(function (p) {
+      return p.name === name && (!a.actor_team || p.team === a.actor_team);
+    });
+    var actor = alike.length === 1 ? alike[0] : {};
+    var team = st.uses_teams && a.actor_team ? '<span class="row" style="justify-content:center;gap:16px;margin-top:22px;font:700 40px Cairo,sans-serif;color:var(--m70)">' + teamMark(a.actor_team, 54) + 'يمثّل لـ' + teamName(a.actor_team) + '</span>' : '';
+    var count = '<span class="pill">الدور <span class="ltr">' + st.round_no + '/' + st.rounds + '</span></span>';
+    var category = a.category ? '<span class="pill" style="color:var(--coin)">' + esc(a.category) + '</span>' : '';
+    var scores = st.uses_teams ? scoresRow(a.team_scores) : playerScores(st.players);
+    // The body starts under the top bar and the scores, never behind them.
+    var top = 190 + SCORES_H;
+    var body = '<div class="center" style="top:' + top + 'px;bottom:24px"><div id="a-body" style="display:flex;flex-direction:column;align-items:center">';
+    if (st.status === 'acting_reveal') {
+      var got = a.outcome === 'guessed';
+      var who = !got ? '<span style="color:var(--m70)">لم يخمّنها أحد</span>'
+        : st.uses_teams ? teamMark(a.actor_team, 60) + '<span>أصابها ' + teamName(a.actor_team) + '</span>'
+        : '<span>خمّنها ' + esc(a.guessed_by_name || '') + '</span>';
+      // Solo, the actor scores too (acting_actor_points); in teams the team's row says it.
+      var actorPoints = got && !st.uses_teams
+        ? '<span style="color:var(--m70)">و' + esc(name) + '</span> <span class="lz ltr" style="color:var(--coin)">+50</span>' : '';
+      stage.innerHTML = topBar(st, '<div class="row" style="gap:22px">' + count + category + '</div>', false) + scores + body +
+          '<div class="card" style="min-width:900px;max-width:1520px;padding:40px 60px;box-shadow:inset 0 0 0 6px ' + (got ? 'var(--truth)' : 'var(--m60)') + '"><div style="font:700 34px Cairo,sans-serif;color:' + (got ? 'var(--truth)' : 'var(--m70)') + '">الكلمة</div>' +
+          '<div class="lz" style="margin-top:8px;font-size:120px;line-height:1.25">' + esc(a.word) + '</div></div>' +
+          '<div class="row" style="justify-content:center;gap:18px;margin-top:40px;font:700 50px Cairo,sans-serif">' + who +
+            (got ? ' <span class="lz ltr" style="color:var(--coin)">+100</span>' : '') + actorPoints + '</div>' +
+          '<div style="margin-top:26px;font:600 32px Cairo,sans-serif;color:var(--m60)">الدور التالي بعد لحظات</div></div></div>';
+    } else {
+      var ready = st.status === 'acting_ready';
+      var s = secondsLeft(st);
+      stage.innerHTML = topBar(st, count, false) + scores + body + avatar(name, 160, false, actor.avatar_url) +
+          '<div class="lz" style="margin-top:24px;font-size:96px">' + named(name, actor.verified, 80) + (ready ? ' يستعد للتمثيل' : ' يمثّل') + '</div>' + team +
+          (a.category ? '<div class="lz" style="margin-top:18px;padding:12px 44px;border-radius:999px;background:var(--card);font-size:56px;color:var(--coin)">' + esc(a.category) + '</div>' : '') +
+          '<div style="margin-top:40px">' + ring(s, totalFor(st, s), ready ? 200 : 300) + '</div>' +
+          '<div style="margin-top:34px;font:700 44px Cairo,sans-serif;color:var(--m70)">' +
+            (ready ? 'مثّلها بلا كلام ولا أصوات ولا حروف' : st.uses_teams ? 'فريقه يخمّن، والبقية يتفرجون' : 'خمّنوا بصوت عالٍ') + '</div></div></div>';
+    }
+    fitHeight(document.getElementById('a-body'), 1056 - top);
+  }
+
+  // A team game's end: the teams, not the podium.
+  function renderTeamFinal(st, list, title) {
+    var teams = (list || []).slice().sort(function (x, y) { return (y.score || 0) - (x.score || 0); });
+    var top = teams.length ? teams[0].score : 0;
+    var lead = teams.filter(function (t) { return t.score === top; });
+    var winner = lead.length === 1 ? '<span class="row" style="justify-content:center;gap:24px">' + teamMark(lead[0].team, 110) + '<span>' + teamName(lead[0].team) + ' يفوز</span></span>' : 'تعادل على القمة';
+    var rows = teams.map(function (t, i) {
+      var first = t.score === top;
+      return '<div class="row" style="gap:28px;width:1000px;margin-top:20px;padding:24px 40px;border-radius:32px;background:var(--card);' + (first ? 'box-shadow:inset 0 0 0 5px var(--gold)' : '') + '">' +
+        '<span class="lz" style="width:150px;font-size:44px;color:' + (first ? 'var(--coin)' : 'var(--m60)') + '">' + ordinal(i + 1) + '</span>' + teamMark(t.team, 76) +
+        '<span style="flex:1;font:700 44px Cairo,sans-serif">' + teamName(t.team) + '</span><span class="lz ltr" style="font-size:56px;color:var(--coin)">' + score(t.score || 0) + '</span></div>';
+    }).join('');
+    stage.innerHTML = '<div class="center"><div class="lz" style="font-size:72px;color:var(--m70)">' + title + '</div>' +
+      '<div class="lz" style="margin:18px 0 26px;font-size:100px;color:var(--coin)">' + winner + '</div>' + rows + '</div>';
+  }
+
+  function renderPaused() {
+    var old = document.getElementById('paused');
+    if (old) old.remove();
+    stage.insertAdjacentHTML('beforeend', '<div id="paused" class="row" style="position:absolute;top:24px;left:50%;transform:translateX(-50%);padding:18px 36px;border-radius:999px;background:var(--gold);color:var(--canvas);font:700 34px Cairo,sans-serif">أوقف المضيف اللعبة مؤقتًا</div>');
+  }
+
+  function render(st) {
+    switch (st.status) {
+      case 'picking': renderPicking(st); break;
+      case 'writing': renderWriting(st); break;
+      case 'choosing': renderChoosing(st); break;
+      case 'reveal': case 'awards': renderReveal(st); break;
+      case 'board_pick': case 'board_question': case 'board_judge': case 'board_reveal': renderBoard(st); break;
+      case 'acting_ready': case 'acting_live': case 'acting_reveal': renderActing(st); break;
+      case 'final':
+        if (st.mode === 'board') renderTeamFinal(st, (st.board || {}).scores, 'انتهت اللوحة');
+        else if (st.mode === 'acting' && st.uses_teams) renderTeamFinal(st, (st.acting || {}).team_scores, 'انتهى التمثيل');
+        else renderFinal(st);
+        break;
+      case 'countdown': renderCountdown(st); break;
+      default: renderLobby(st);
+    }
+    if (st.paused) renderPaused();
+    polyfillGap();
+  }
+
+  function poll() {
+    if (!code) return Promise.resolve();
+    return rpc('bluff_tv_state', { p_tv_code: code }).then(function (st) {
+      net.style.display = 'none';
+      if (st.status === 'unpaired') {
+        // A pairing that existed and now reads unpaired was unpaired or its room
+        // was deleted, and either way this code is dead: pairing only ever claims
+        // a row that is still there. A code nobody claimed dies too, when the
+        // server drops it at 6 hours. Ask for a fresh one before that.
+        if (wasPaired || Date.now() - codeAt >= CODE_TTL_MS) return register();
+        return;
+      }
+      // The host ended the room. Showing its join code now would invite people
+      // into nothing, and the TV must be ready for the next room.
+      if (st.status === 'gone') return register();
+      wasPaired = true;
+      st._receivedAt = Date.now();
+      render(st);
+    }).catch(function () {
+      net.textContent = 'انقطع الاتصال… نعيد ربطك';
+      net.style.display = 'block';
+    });
+  }
+
+  if (!cfg.url || !cfg.anonKey) { renderSetup(); return; }
+
+  function loop() { poll().then(function () { setTimeout(loop, POLL_MS); }); }
+
+  token = loadToken();
+  var stored = storedCode();
+  if (stored) { code = stored.code; codeAt = stored.at; renderCode(); loop(); }
+  else {
+    (function first() {
+      register().then(loop).catch(function () {
+        net.textContent = 'انقطع الاتصال… نعيد ربطك';
+        net.style.display = 'block';
+        setTimeout(first, 3000);
+      });
+    })();
+  }
+})();
+</script>
+</body>
+</html>
